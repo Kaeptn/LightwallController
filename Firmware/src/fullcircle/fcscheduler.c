@@ -27,7 +27,8 @@
 #include "fcserver.h" /* Necessary the timing supervision */
 #include "dmx/dmx.h"
 
-#define FCSCHED_CONFIGURATION_FILE	"fc/conf/wall"
+#define FCSCHED_WALLCFG_FILE	"fc/conf/wall"
+#define FCSCHED_CONFIG_FILE     "fc/conf/controller"
 #define FCSCHED_FILE_ROOT			"fc/static\0"	/**< Folder on the sdcard to check */
 
 #define	FILENAME_LENGTH			512	/**< Including the absolut path to the file */
@@ -38,11 +39,12 @@
 
 #define MATCH(s, n) strcmp(section, s) == 0 && strcmp(name, n) == 0
 
-#define FCSHED_PRINT( ... )	if (gDebugShell) { chprintf(gDebugShell, __VA_ARGS__); }
+#define FCSCHED_PRINT( ... )	if (gDebugShell) { chprintf(gDebugShell, __VA_ARGS__); }
 
 #define	MSG_ACTIVATE_SHELL	1
-#define	MSG_SETFPS			2
-#define	MSG_DIMM			3
+#define	MSG_SETFPS		2
+#define	MSG_DIMM		3
+#define MSG_STOPP               4
 
 /** @typedef fcsource_state_t
  * @brief Status of the actual used source.
@@ -93,17 +95,23 @@ static fcsource_state_t gSourceState = FCSRC_STATE_NOBODY;
 uint32_t gFcConnectedClients = 0;
 
 static uint32_t gDynamicServerTimeout = FCSCHED_DYNSERVER_RESETVALUE;
+static uint8_t  gSchedulerActive = TRUE;
 
 /******************************************************************************
  * LOCAL FUNCTIONS
  ******************************************************************************/
 
-static void
-fcsched_handleInputMailbox(void)
+/**
+ * @fn static int fcsched_handleInputMailbox(void)
+ *
+ * Handle all incoming messages from the mailbox
+ * @return 1 if the loop must be skipped completely
+ */
+static int fcsched_handleInputMailbox(void)
 {
   msg_t msg1, msg2, status;
   int newMessages;
-
+  int retStatus = 0;
   /* Use nonblocking function to count incoming messages */
   newMessages = chMBGetUsedCountI(&mailboxIn);
 
@@ -130,6 +138,12 @@ fcsched_handleInputMailbox(void)
               case MSG_DIMM:
                 wallcfg.dimmFactor = (int) msg2;
                 break;
+              case MSG_STOPP:
+                gSchedulerActive = 0;
+                gFcServerActive = TRUE; /* The server has an GO */
+                palSetPad(GPIOD, GPIOD_LED4); /* Green.  */
+                palClearPad(GPIOD, GPIOD_LED5); /* Red.  */
+                retStatus = 1;
               default:
                 break;
                 }
@@ -137,6 +151,7 @@ fcsched_handleInputMailbox(void)
             }
         }
     }
+   return retStatus;
 }
 
 /** @fn static void fcsched_handleFcMailboxDyn(uint32_t sleeptime)
@@ -158,7 +173,7 @@ static void fcsched_handleFcMailboxDyn(uint32_t sleeptime)
       if (status == RDY_OK)
         {
           chSysLock();
-          FCSHED_PRINT("%d\r\n", ((uint32_t ) msg1));
+          FCSCHED_PRINT("%d\r\n", ((uint32_t ) msg1));
           chSysUnlock();
           gDynamicServerTimeout = FCSCHED_DYNSERVER_RESETVALUE;
         }
@@ -167,7 +182,7 @@ static void fcsched_handleFcMailboxDyn(uint32_t sleeptime)
     {
       if (gSourceState == FCSRC_STATE_NETWORK)
         {
-          FCSHED_PRINT("FcDyn timeout %6d / %6d [ms]\r\n",
+          FCSCHED_PRINT("FcDyn timeout %6d / %6d [ms]\r\n",
               FCSCHED_DYNSERVER_RESETVALUE - gDynamicServerTimeout, FCSCHED_DYNSERVER_RESETVALUE);
 
           if (gDynamicServerTimeout == 0)
@@ -179,7 +194,7 @@ static void fcsched_handleFcMailboxDyn(uint32_t sleeptime)
               || gDynamicServerTimeout > FCSCHED_DYNSERVER_RESETVALUE)
           {
               gDynamicServerTimeout = 0; /* deactivate monitoring */
-              FCSHED_PRINT("%d wall is dead. (actual %d clients connected)\r\n",
+              FCSCHED_PRINT("%d wall is dead. (actual %d clients connected)\r\n",
                   gSourceState, gFcConnectedClients);
               gSourceState = FCSRC_STATE_NOBODY;
 
@@ -254,6 +269,32 @@ wall_handler(void* config, const char* section, const char* name,
   return 1;
 }
 
+/** @fn static int configuration_handler(void* config, const char* section, const char* name, const char* value)
+ * @brief Extract the configuration for the scheduler
+ *
+ * @param[in]   config  structure, all found values are stored
+ * @param[in]   section section, actual found
+ * @param[in]   name    key
+ * @param[in]   value   value
+ *
+ * @return < 0 on errors
+ */
+static int
+configuration_handler(void* config, const char* section, const char* name,
+    const char* value)
+{
+  schedulerconf_t* pconfig = (schedulerconf_t*) config;
+  if (MATCH("scheduler", "netonly"))
+    {
+      pconfig->netOnly = strtol(value, NULL, 10);
+    }
+  else
+    {
+      return 0; /* unknown section/name, error */
+    }
+  return 1;
+}
+
 /******************************************************************************
  * GLOBAL FUNCTIONS
  ******************************************************************************/
@@ -276,6 +317,7 @@ fc_scheduler(void *p)
   char *filename = NULL;
   uint32_t filenameLength = 0;
   char* root = FCSCHED_FILE_ROOT;
+  schedulerconf_t schedConfiguration;
 
   /* SD card initing variables */
   FRESULT err;
@@ -305,29 +347,49 @@ fc_scheduler(void *p)
       err = f_getfree("/", &clusters, &fsp);
       chThdSleep(MS2ST(100));
     }
-  while (err != FR_OK)
-    ;
+  while (err != FR_OK);
 
+  /* Load wall configuration */
   readConfigurationFile(&wallcfg);
+
+    /* Load the configuration */
+    hwal_memset(&schedConfiguration, 0, sizeof(wallconf_t));
+
+    ini_parse(FCSCHED_CONFIG_FILE, configuration_handler, &schedConfiguration);
 
   /* Prepare Mailbox to communicate with the others */
   chMBInit(&mailboxIn, (msg_t *) buffer4mailbox2, INPUT_MAILBOX_SIZE);
   path[0] = 0;
+
+  /* Deactivate this thread, if necessary */
+  if (schedConfiguration.netOnly)
+    {
+      FCSCHED_PRINT("Deactivating Scheduler");
+      chSysLock();
+      chMBPostI(&mailboxIn, (uint32_t) MSG_STOPP);
+      chMBPostI(&mailboxIn, (uint32_t) 1);
+      chSysUnlock();
+    }
 
   resOpen = fcstatic_open_sdcard();
 
   /* initialize the folder to search in */
   hwal_memcpy(path, root, strlen(FCSCHED_FILE_ROOT));
 
-  do
+  while ( gSchedulerActive )
     {
-      fcsched_handleInputMailbox();
+      if (fcsched_handleInputMailbox())
+        {
+        continue;
+        }
       fcsched_handleFcMailboxDyn(sleeptime);
 
       switch (gSourceState)
         {
       case FCSRC_STATE_NOBODY:
         /* Deactivate network code stuff */
+
+        FCSCHED_PRINT("Net ONLY ?!? %d\r\n",        schedConfiguration.netOnly);
 
         /*set server inactive */
         gFcServerActive = 0;
@@ -340,7 +402,7 @@ fc_scheduler(void *p)
                 filename);
             if (res)
               {
-                FCSHED_PRINT("%s ...\r\n", path);
+                FCSCHED_PRINT("%s ...\r\n", path);
 
                 /* Initialize the file for playback */
                 seqRet = fcseq_load(path, &seq);
@@ -351,7 +413,7 @@ fc_scheduler(void *p)
                     rgb24 = (uint8_t*) chHeapAlloc(NULL,
                         (seq.width * seq.height * 3));
                     seq.fps = wallcfg.fps;
-                    FCSHED_PRINT("Using %d fps and dimmed to %d %.\r\n",
+                    FCSCHED_PRINT("Using %d fps and dimmed to %d %.\r\n",
                         seq.fps, wallcfg.dimmFactor);
                     sleeptime = (1000 / seq.fps);
                     palSetPad(GPIOD, GPIOD_LED5); /* Red.  */
@@ -371,7 +433,7 @@ fc_scheduler(void *p)
           }
         else
           {
-            FCSHED_PRINT("Reopen SDcard\r\n");
+            FCSCHED_PRINT("Reopen SDcard\r\n");
             resOpen = fcstatic_open_sdcard();
           }
         break;
@@ -390,7 +452,7 @@ fc_scheduler(void *p)
         fcstatic_remove_filename(path, &filename, filenameLength);
         gSourceState = FCSRC_STATE_NOBODY;
 
-        FCSHED_PRINT("Check Ethernet interface %d\r\n", gFcConnectedClients)
+        FCSCHED_PRINT("Check Ethernet interface %d\r\n", gFcConnectedClients)
         ;
 
         if (gFcConnectedClients)
@@ -424,12 +486,12 @@ fc_scheduler(void *p)
         if (gFcConnectedClients <= 0)
           {
             gSourceState = FCSRC_STATE_NOBODY;
-            FCSHED_PRINT("CLient disconnected %d\r\n", gSourceState);
+            FCSCHED_PRINT("CLient disconnected %d\r\n", gSourceState);
           }
         break;
       default:
         /*FIXME check dynamic fullcircle for a new client */
-        FCSHED_PRINT("Unkown status: %d\r\n", gSourceState)
+        FCSCHED_PRINT("Unkown status: %d\r\n", gSourceState)
         ;
         break;
         }
@@ -437,7 +499,6 @@ fc_scheduler(void *p)
       chThdSleep(MS2ST(sleeptime /* convert milliseconds to system ticks */));
 
     }
-  while ( TRUE);
 
   /* clean the memory of the configuration */
   if (wallcfg.pLookupTable)
@@ -445,7 +506,7 @@ fc_scheduler(void *p)
       hwal_free(wallcfg.pLookupTable);
     }
 
-  FCSHED_PRINT("Scheduler stopped!\r\n");
+  FCSCHED_PRINT("Scheduler stopped!\r\n");
 
   return RDY_OK;
 }
@@ -468,7 +529,7 @@ readConfigurationFile(wallconf_t* pConfiguration)
   pConfiguration->fps = -1;
 
   /* Load the configuration */
-  ini_parse(FCSCHED_CONFIGURATION_FILE, wall_handler, pConfiguration);
+  ini_parse(FCSCHED_WALLCFG_FILE, wall_handler, pConfiguration);
 }
 
 extern void
@@ -506,7 +567,7 @@ fcscheduler_cmdline(BaseSequentialStream *chp, int argc, char *argv[])
 {
   if (argc < 1)
     {
-      chprintf(chp, "Usage {debugOn, debugOff, fps (value), dim}\r\n");
+      chprintf(chp, "Usage {debugOn, debugOff, fps (value), dim, stop}\r\n");
       return;
     }
   else if (argc >= 1)
@@ -547,13 +608,20 @@ fcscheduler_cmdline(BaseSequentialStream *chp, int argc, char *argv[])
           /* Activate the debugging */
           chprintf(chp, "Fullcircle Scheduler - Update dimming %d\r\n",
               atoi(argv[1]));
-          chSysLock()
-          ;
+          chSysLock();
           chMBPostI(&mailboxIn, (uint32_t) MSG_DIMM);
           chMBPostI(&mailboxIn, (uint32_t) atoi(argv[1]));
           chSysUnlock();
         }
-
+      else if (strcmp(argv[0], "stop") == 0)
+        {
+          /* Activate the debugging */
+          chprintf(chp, "Fullcircle Scheduler - Stopped\r\n");
+          chSysLock();
+          chMBPostI(&mailboxIn, (uint32_t) MSG_STOPP);
+          chMBPostI(&mailboxIn, (uint32_t) 1);
+          chSysUnlock();
+        }
     }
 
 }
