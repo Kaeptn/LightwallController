@@ -1,9 +1,8 @@
-/* @file fcseq.h
- * @brief This module parses an sequence file
+/* @file dmx_cmd.h
+ * @brief Debuging tool, to modify the shared memory for DMX.
  * @author Ollo
  *
  * @date 04.10.2013 – Created
- * @date 04.10.2013 – Doxygen documentation added
  * @defgroup DMX
  *
  */
@@ -19,17 +18,19 @@
 #include "chprintf.h"
 
 #ifdef __cplusplus /* If this is a C++ compiler, use C linkage */
-extern "C" {
+extern "C"
+{
 #endif
-	
-	/* @brief Hook for Chibios to the commandline logic
-	 * @param chp	input and output stream for the Chibios
-	 * @param argc	amount of arguments
-	 * @param argv	the arguments themself
-	 * @return nothing, even on problems and errors
-	 */
-	void cmd_dmx_modify(BaseSequentialStream *chp, int argc, char *argv[]);
-	
+
+  /* @brief Hook for Chibios to the commandline logic
+   * @param chp	input and output stream for the Chibios
+   * @param argc	amount of arguments
+   * @param argv	the arguments themself
+   * @return nothing, even on problems and errors
+   */
+  void
+  cmd_dmx_modify(BaseSequentialStream *chp, int argc, char *argv[]);
+
 #ifdef __cplusplus
 }
 #endif

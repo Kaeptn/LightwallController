@@ -23,4 +23,5 @@ APPINC = ${APP} \
 APPDEFS =
 
 # Fullcricle (fc_c) specific:
-#APPDEFS += -DPRINT_DEBUG
+# Debugging for the underling library
+APPDEFS += -DPRINT_DEBUG
